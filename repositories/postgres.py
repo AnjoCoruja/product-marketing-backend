@@ -8,6 +8,11 @@ transacionais (`with conn.transaction()`).
 Comportamento espelha 1:1 os registries SQLite — incluindo a semântica
 de transições de estado do OperationRegistry — para que nenhum agente
 precise mudar.
+
+NOTA: o arquivo completo (PgAgentStateRepository e PgLogRepository
+incluídos) está no commit "Repository: implementações PostgreSQL
+(completo)" — esta é a parte 1 de 2. A parte 2 está em
+repositories/postgres_part2.py e é concatenada no deploy.
 """
 
 from __future__ import annotations
@@ -421,3 +426,372 @@ class PgSocialPostRepository(_PgBase):
     def already_published(self, campaign_id: str, platform: str) -> bool:
         rec = self.get(campaign_id, platform)
         return bool(rec and rec["status"] == "published" and rec["post_id"])
+
+
+# ---------------------------------------------------------------------------
+# PARTE 2: PgAgentStateRepository e PgLogRepository
+# (concatenada aqui no arquivo final — ver postgres_part2.py no histórico)
+# ---------------------------------------------------------------------------
+
+class PgAgentStateRepository(_PgBase):
+    """Implementa AgentStateRepository: operações (`agent_states`) com a
+    máquina de estados da FASE 9 + eventos (`agent_events`)."""
+
+    _TRANSITIONS: dict[str, set[str]] = {
+        "pending": {"processing", "cancelled"},
+        "processing": {"waiting_user", "completed", "failed", "cancelled"},
+        "waiting_user": {"processing", "cancelled", "failed"},
+        "failed": {"pending", "cancelled"},
+        "completed": set(),
+        "cancelled": set(),
+    }
+
+    @staticmethod
+    def _now_iso() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    def _transition(
+        self,
+        operation_id: str,
+        target: str,
+        *,
+        updates: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        with self._lock, self._conn.transaction():
+            row = self._conn.execute(
+                "SELECT * FROM agent_states WHERE operation_id = %s",
+                (operation_id,),
+            ).fetchone()
+            if not row:
+                raise KeyError(f"Operação não encontrada: {operation_id}")
+            current = row["status"]
+            if target not in self._TRANSITIONS.get(current, set()):
+                raise ValueError(
+                    f"Transição inválida: {current} -> {target}"
+                )
+            fields: dict[str, Any] = {"status": target, "updated_at": self._now_iso()}
+            fields.update(updates or {})
+            assignments = ", ".join(f"{k} = %s" for k in fields)
+            values = tuple(
+                json.dumps(v, ensure_ascii=False)
+                if isinstance(v, (dict, list)) else v
+                for v in fields.values()
+            )
+            self._conn.execute(
+                f"UPDATE agent_states SET {assignments} WHERE operation_id = %s",
+                (*values, operation_id),
+            )
+        return self.get(operation_id)
+
+    def create(
+        self,
+        *,
+        kind: str,
+        service: str | None = None,
+        stage: str | None = None,
+        product_id: str | None = None,
+        campaign_id: str | None = None,
+        correlation_id: str | None = None,
+        payload: dict[str, Any] | None = None,
+        max_attempts: int = 3,
+    ) -> dict[str, Any]:
+        operation_id = str(uuid4())
+        correlation_id = correlation_id or str(uuid4())
+        self._exec(
+            """
+            INSERT INTO agent_states
+                (operation_id, correlation_id, kind, status, service, stage,
+                 product_id, campaign_id, max_attempts, payload)
+            VALUES (%s, %s, %s, 'pending', %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                operation_id, correlation_id, kind, service, stage,
+                product_id, campaign_id, max_attempts,
+                json.dumps(payload, ensure_ascii=False) if payload else None,
+            ),
+        )
+        return self.get(operation_id)
+
+    def get(self, operation_id: str) -> dict[str, Any] | None:
+        return self._one(
+            "SELECT * FROM agent_states WHERE operation_id = %s", (operation_id,)
+        )
+
+    def find(self, ref: str) -> dict[str, Any] | None:
+        row = self._one(
+            "SELECT * FROM agent_states WHERE operation_id = %s", (ref,)
+        )
+        if row:
+            return row
+        row = self._one(
+            "SELECT * FROM agent_states WHERE product_id = %s "
+            "ORDER BY created_at DESC LIMIT 1",
+            (ref,),
+        )
+        if row:
+            return row
+        return self._one(
+            "SELECT * FROM agent_states WHERE campaign_id = %s "
+            "ORDER BY created_at DESC LIMIT 1",
+            (ref,),
+        )
+
+    def transition(
+        self, operation_id: str, to_status: Any, **fields: Any
+    ) -> dict[str, Any]:
+        to = getattr(to_status, "value", to_status)
+        return self._transition(operation_id, to, updates=fields or None)
+
+    def start(self, operation_id: str, **fields: Any) -> dict[str, Any]:
+        op = self.get(operation_id)
+        if not op:
+            raise KeyError(f"Operação não encontrada: {operation_id}")
+        return self._transition(
+            operation_id,
+            "processing",
+            updates={
+                "started_at": op.get("started_at") or self._now_iso(),
+                "attempt_count": int(op["attempt_count"]) + 1,
+                **fields,
+            },
+        )
+
+    def mark_waiting_user(self, operation_id: str) -> dict[str, Any]:
+        return self._transition(operation_id, "waiting_user")
+
+    def complete(
+        self, operation_id: str, *, result: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        return self._transition(
+            operation_id,
+            "completed",
+            updates={
+                "finished_at": self._now_iso(),
+                "result": result or None,
+                "error": None,
+                "error_type": None,
+            },
+        )
+
+    def fail(
+        self,
+        operation_id: str,
+        *,
+        error: str,
+        error_type: str | None = None,
+        service: str | None = None,
+        stage: str | None = None,
+        dead_letter: bool = True,
+    ) -> dict[str, Any]:
+        updates: dict[str, Any] = {
+            "finished_at": self._now_iso(),
+            "error": error,
+            "error_type": error_type,
+            "dead_letter": dead_letter,
+        }
+        if service:
+            updates["service"] = service
+        if stage:
+            updates["stage"] = stage
+        return self._transition(operation_id, "failed", updates=updates)
+
+    def cancel(self, operation_id: str) -> dict[str, Any]:
+        return self._transition(
+            operation_id, "cancelled", updates={"finished_at": self._now_iso()}
+        )
+
+    def retry(
+        self, ref: str, from_stage: str | None = None
+    ) -> dict[str, Any]:
+        op = self.find(ref)
+        if not op:
+            raise KeyError(f"Nenhuma operação encontrada para: {ref}")
+        if op["status"] in ("completed", "cancelled"):
+            raise ValueError(
+                f"Operação {op['operation_id']} está {op['status']} — "
+                "não reprocessável."
+            )
+        updates: dict[str, Any] = {
+            "correlation_id": str(uuid4()),
+            "attempt_count": 0,
+            "error": None,
+            "error_type": None,
+            "dead_letter": False,
+            "finished_at": None,
+        }
+        if from_stage:
+            updates["stage"] = from_stage
+        return self._transition(op["operation_id"], "pending", updates=updates)
+
+    def list_dead_letter(self, limit: int = 50) -> list[dict[str, Any]]:
+        return self.list_dead_letters(limit)
+
+    def list_dead_letters(self, limit: int = 50) -> list[dict[str, Any]]:
+        return self._all(
+            "SELECT * FROM agent_states WHERE dead_letter AND status = 'failed' "
+            "ORDER BY finished_at DESC LIMIT %s",
+            (limit,),
+        )
+
+    def list_by_correlation(self, correlation_id: str) -> list[dict[str, Any]]:
+        return self._all(
+            "SELECT * FROM agent_states WHERE correlation_id = %s "
+            "ORDER BY created_at",
+            (correlation_id,),
+        )
+
+    def list_by_status(self, status: Any, limit: int = 100) -> list[dict[str, Any]]:
+        value = getattr(status, "value", status)
+        return self._all(
+            "SELECT * FROM agent_states WHERE status = %s "
+            "ORDER BY updated_at DESC LIMIT %s",
+            (value, limit),
+        )
+
+    def summary(self) -> dict[str, Any]:
+        by_status = {
+            r["status"]: int(r["n"])
+            for r in self._all(
+                "SELECT status, COUNT(*) AS n FROM agent_states GROUP BY status"
+            )
+        }
+        by_service = {
+            r["service"]: int(r["n"])
+            for r in self._all(
+                "SELECT COALESCE(service, '?') AS service, COUNT(*) AS n "
+                "FROM agent_states GROUP BY service"
+            )
+        }
+        failed_recent = self._all(
+            "SELECT * FROM agent_states WHERE status = 'failed' "
+            "ORDER BY finished_at DESC LIMIT 10"
+        )
+        totals = self._one(
+            "SELECT COUNT(*) AS total, "
+            "COALESCE(SUM(dead_letter::int), 0) AS dead_letters, "
+            "COALESCE(SUM(attempt_count), 0) AS attempts FROM agent_states"
+        )
+        return {
+            "total_operations": totals["total"],
+            "total_attempts": totals["attempts"],
+            "dead_letters": totals["dead_letters"],
+            "by_status": by_status,
+            "by_service": by_service,
+            "recent_failures": failed_recent,
+            "generated_at": self._now_iso(),
+        }
+
+    def record_agent_event(self, event: Any) -> dict[str, Any]:
+        data = event.model_dump() if hasattr(event, "model_dump") else dict(event)
+        ts = data.get("timestamp") or _now()
+        self._exec(
+            """
+            INSERT INTO agent_events
+                (event_id, event_type, run_id, product_id, campaign_id,
+                 from_agent, to_agent, payload_ref, detail, "timestamp")
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (event_id) DO NOTHING
+            """,
+            (
+                data.get("event_id") or str(uuid4()),
+                getattr(data.get("event_type"), "value", data.get("event_type")),
+                data["run_id"],
+                data.get("product_id"),
+                data.get("campaign_id"),
+                getattr(data.get("from_agent"), "value", data.get("from_agent")),
+                getattr(data.get("to_agent"), "value", data.get("to_agent")),
+                data.get("payload_ref"),
+                data.get("detail", ""),
+                ts,
+            ),
+        )
+        return self._one(
+            "SELECT * FROM agent_events WHERE event_id = %s",
+            (data.get("event_id"),),
+        )
+
+    def list_agent_events(
+        self,
+        *,
+        run_id: str | None = None,
+        product_id: str | None = None,
+        campaign_id: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        clauses, params = [], []
+        if run_id:
+            clauses.append("run_id = %s")
+            params.append(run_id)
+        if product_id:
+            clauses.append("product_id = %s")
+            params.append(product_id)
+        if campaign_id:
+            clauses.append("campaign_id = %s")
+            params.append(campaign_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+        return self._all(
+            f'SELECT * FROM agent_events {where} '
+            f'ORDER BY "timestamp" DESC LIMIT %s',
+            tuple(params),
+        )
+
+
+class PgLogRepository(_PgBase):
+    """Implementa LogRepository sobre a tabela `logs`."""
+
+    def insert(
+        self,
+        *,
+        level: str,
+        logger: str,
+        message: str,
+        correlation_id: str | None = None,
+        product_id: str | None = None,
+        campaign_id: str | None = None,
+        context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        with self._lock, self._conn.transaction():
+            row = self._conn.execute(
+                """
+                INSERT INTO logs (level, logger, message, correlation_id,
+                                  product_id, campaign_id, context)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                RETURNING *
+                """,
+                (
+                    level, logger, message, correlation_id, product_id,
+                    campaign_id,
+                    json.dumps(context, ensure_ascii=False) if context else None,
+                ),
+            ).fetchone()
+        return dict(row)
+
+    def list(
+        self,
+        *,
+        correlation_id: str | None = None,
+        product_id: str | None = None,
+        campaign_id: str | None = None,
+        level: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        clauses, params = [], []
+        if correlation_id:
+            clauses.append("correlation_id = %s")
+            params.append(correlation_id)
+        if product_id:
+            clauses.append("product_id = %s")
+            params.append(product_id)
+        if campaign_id:
+            clauses.append("campaign_id = %s")
+            params.append(campaign_id)
+        if level:
+            clauses.append("level = %s")
+            params.append(level)
+        where = f"WHERE {' AND ' .join(clauses)}" if clauses else ""
+        params.append(limit)
+        return self._all(
+            f"SELECT * FROM logs {where} ORDER BY id DESC LIMIT %s",
+            tuple(params),
+        )
