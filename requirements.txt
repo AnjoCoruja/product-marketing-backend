@@ -1,0 +1,30 @@
+# Core
+python-dotenv>=1.0.1
+pydantic>=2.7.0
+pydantic-settings>=2.2.0
+tenacity>=8.3.0
+
+# LangChain / LangGraph
+langchain-core>=0.2.0
+langchain>=0.2.0
+langgraph>=0.2.0
+
+# API do servico (recebe o webhook do n8n)
+fastapi>=0.110.0
+uvicorn>=0.29.0
+
+# HTTP (usado pelas tools nas fases seguintes)
+httpx>=0.27.0
+
+# Testes
+pytest>=8.2.0
+pytest-asyncio>=0.23.0
+langgraph-checkpoint-sqlite>=3.1
+
+# Google Drive + Sheets (FASE 4) — DESABILITADO: n8n cuida via OAuth
+# google-api-python-client>=2.100.0
+# google-auth>=2.29.0
+
+# Camada Repository — PostgreSQL (produção)
+psycopg[binary]>=3.1.0
+langgraph-checkpoint-postgres>=2.0.0
